@@ -197,18 +197,13 @@ func (cb *CopyWithPq) saveOrLoadKeysetPaginatedTableIdRange(ctx context.Context,
 }
 
 func (cb *CopyWithPq) DoCopy(ctx context.Context, transactionSnapshotId string) error {
+	fmt.Println(cb.Cfg.SourceConnection)
 	srcConn, err := pgx.Connect(ctx, cb.Cfg.SourceConnection)
 	if err != nil {
 		return err
 	}
 	defer srcConn.Close(ctx)
 	srcConnTxn, err := srcConn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-
-	srcTableColumnNames, err := getColumnNamesForTable(ctx, srcConnTxn,
-		cb.Cfg.SourceSchemaName, cb.Cfg.SourceTableName)
 	if err != nil {
 		return err
 	}
@@ -246,32 +241,54 @@ func (cb *CopyWithPq) DoCopy(ctx context.Context, transactionSnapshotId string) 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	done := make(chan bool)
 
-	// Spawn workers.
-	for i := 0; i < cb.Cfg.CopyWorkerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-done:
-					return
-				case <-ctx.Done():
-					return
-				case nextIdRange := <-pendingWorkChan:
-					log.Printf("Starting batch for range: %d through %d", nextIdRange.StartAt, nextIdRange.EndAt)
+	tables, err := srcConn.Query(context.Background(), "SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public'")
+	if err != nil {
+		return err
+	}
+	defer tables.Close()
 
-					err := withHotStandbyRetry(func() error {
-						return cb.CopyOneBatchCustomImpl(ctx, srcTableColumnNames, nextIdRange, transactionSnapshotId)
-					})
-					if err != nil {
-						errorsChan <- err
-						continue
+	for tables.Next() {
+		var tableName string
+		err = tables.Scan(&tableName)
+		if err != nil {
+			return err
+		}
+
+		srcTableColumnNames, err := getColumnNamesForTable(ctx, srcConnTxn,
+			cb.Cfg.SourceSchemaName, tableName)
+		if err != nil {
+			return err
+		}
+
+		//iterate through a list of tables.
+		// Spawn workers.
+		for i := 0; i < cb.Cfg.CopyWorkerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-done:
+						return
+					case <-ctx.Done():
+						return
+					case nextIdRange := <-pendingWorkChan:
+						log.Printf("Starting batch for range: %d through %d", nextIdRange.StartAt, nextIdRange.EndAt)
+
+						err := withHotStandbyRetry(func() error {
+							//if in config we have copy entire db enabled pass a table name from tables list
+							return cb.CopyOneBatchCustomImpl(ctx, srcTableColumnNames, nextIdRange, transactionSnapshotId)
+						})
+						if err != nil {
+							errorsChan <- err
+							continue
+						}
+
+						log.Printf("Finished batch for range: %d through %d", nextIdRange.StartAt, nextIdRange.EndAt)
 					}
-
-					log.Printf("Finished batch for range: %d through %d", nextIdRange.StartAt, nextIdRange.EndAt)
 				}
-			}
-		}()
+			}()
+		}
 	}
 
 	// Send work with blocking chan.
