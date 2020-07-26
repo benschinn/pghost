@@ -87,13 +87,7 @@ func (cb *CopyWithPq) CopyOneBatchCustomImpl(ctx context.Context, srcTableColumn
 	defer srcConnTxn.Commit(ctx)
 
 	// See if we should load the commit with an existing transaction snapshot id.
-	if len(transactionSnapshotId) > 0 {
-		_, err = srcConnTxn.Exec(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", transactionSnapshotId))
-		if err != nil {
-			panic(err)
-			return err
-		}
-	}
+	
 
 	destConn, err := pgx.Connect(ctx, cb.Cfg.DestinationConnection)
 	if err != nil {
@@ -121,11 +115,16 @@ func (cb *CopyWithPq) CopyOneBatchCustomImpl(ctx context.Context, srcTableColumn
 }
 
 func getColumnNamesForTable(ctx context.Context, txn pgx.Tx, schemaName, tableName string) ([]string, error) {
+  fmt.Println("table name is: " + tableName)
 	sql := fmt.Sprintf("SELECT column_name FROM information_schema.columns WHERE table_schema = '%s' and table_name = '%s'",
 		schemaName, tableName)
+  fmt.Println("sql is:")
+  fmt.Println(sql)
+  fmt.Println("end")
 
 	rows, err := txn.Query(ctx, sql)
 	if err != nil {
+    fmt.Println("error is occuring here")
 		return nil, err
 	}
 	defer rows.Close()
@@ -196,6 +195,26 @@ func (cb *CopyWithPq) saveOrLoadKeysetPaginatedTableIdRange(ctx context.Context,
 	return idRangeSet, nil
 }
 
+func getTables(ctx context.Context, txn pgx.Tx) ([]string, error){
+
+	rows, err := txn.Query(ctx, "SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public'")
+  if err != nil {
+    return nil, err
+  }
+  defer rows.Close()
+  var tables []string
+
+  for rows.Next() {
+    var tableName string
+    err = rows.Scan(&tableName)
+    if err != nil {
+      return nil, err
+    }
+    tables = append(tables, tableName)
+  }
+  return tables, nil
+}
+
 func (cb *CopyWithPq) DoCopy(ctx context.Context, transactionSnapshotId string) error {
 	fmt.Println(cb.Cfg.SourceConnection)
 	srcConn, err := pgx.Connect(ctx, cb.Cfg.SourceConnection)
@@ -207,6 +226,8 @@ func (cb *CopyWithPq) DoCopy(ctx context.Context, transactionSnapshotId string) 
 	if err != nil {
 		return err
 	}
+  fmt.Println("1. transaction")
+  fmt.Println(srcConnTxn)
 
 	var idRangeSeq IdRangeSeq
 	if cb.Cfg.CopyUseKeysetPagination {
@@ -217,6 +238,7 @@ func (cb *CopyWithPq) DoCopy(ctx context.Context, transactionSnapshotId string) 
 	}
 	// Check error for both IdRangeSeq builders above.
 	if err != nil {
+    fmt.Println("its here 221")
 		return err
 	}
 
@@ -241,19 +263,11 @@ func (cb *CopyWithPq) DoCopy(ctx context.Context, transactionSnapshotId string) 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	done := make(chan bool)
 
-	tables, err := srcConn.Query(context.Background(), "SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public'")
-	if err != nil {
-		return err
-	}
-	defer tables.Close()
-
-	for tables.Next() {
-		var tableName string
-		err = tables.Scan(&tableName)
-		if err != nil {
-			return err
-		}
-
+  tables, err := getTables(ctx, srcConnTxn)
+  if err != nil {
+    return err
+  }
+  for _, tableName := range tables {
 		srcTableColumnNames, err := getColumnNamesForTable(ctx, srcConnTxn,
 			cb.Cfg.SourceSchemaName, tableName)
 		if err != nil {
